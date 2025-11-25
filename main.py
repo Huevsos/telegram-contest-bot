@@ -1519,7 +1519,7 @@ def games_menu_keyboard():
             [{"text": "🏀 Баскетбол", "callback_data": "game_basketball"}],
             [{"text": "⚽ Футбол", "callback_data": "game_football"}],
             [{"text": "🎳 Боулинг", "callback_data": "game_bowling"}],
-            [{"text": "🎿 Санки (RampageBET)", "callback_data": "game_sledge"}],
+            [{"text": "🎿 Санки", "callback_data": "game_sledge"}],
             [{"text": "⬅️ Назад", "callback_data": "main_menu"}]
         ]
     }
@@ -1544,7 +1544,7 @@ def sledge_game_finished_keyboard():
 
 def sledge_bet_amount_keyboard():
     """Клавиатура выбора суммы ставки для игры Санки"""
-    amounts = [10, 25, 50, 100, 200, 500]
+    amounts = [10, 25, 50, 100, 200, 500, last game]
     
     keyboard = []
     row = []
@@ -2779,7 +2779,7 @@ def handle_callback(callback_query):
                     current_time = 0
                 
                 edit_message(chat_id, message_id,
-                    f"🎿 <b>RampageBET</b>\n\n"
+                    f"🎿 <b>Санки</b>\n\n"
                     f"👤 {player.data.get('username', 'Игрок')} ставит {game['bet_amount']} {currency_text}\n\n"
                     f"🎯 <b>Санки</b>\n"
                     f"Должно выпасть число {game['target_number']}\n\n"
