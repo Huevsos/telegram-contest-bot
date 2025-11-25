@@ -1544,7 +1544,7 @@ def sledge_game_finished_keyboard():
 
 def sledge_bet_amount_keyboard():
     """Клавиатура выбора суммы ставки для игры Санки"""
-    amounts = [10, 25, 50, 100, 200, 500, last game]
+    amounts = [10, 25, 50, 100, 200, 500, 1000, 10000]
     
     keyboard = []
     row = []
