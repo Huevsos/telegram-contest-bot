@@ -809,30 +809,6 @@ def play_sledge_game(user_id, chat_id, bet_amount, currency):
         sledge_game_keyboard(game_id)
     )
 
-    def sledge_games (chat_id, emoji="🎲"):
-    """Отправка анимации"""
-    try:
-        params = {"chat_id": chat_id, "emoji": emoji}
-        response = requests.post(URL + "sendDice", json=params, timeout=25)
-        
-        if response.status_code == 200:
-            result = response.json()
-            message_id = result['result']['message_id']
-            game_results[message_id] = {
-                'chat_id': chat_id,
-                'emoji': emoji,
-                'value': result['result']['dice']['value'],
-                'timestamp': time.time()
-            }
-            return result
-        else:
-            logging.error(f"Ошибка отправки кубика: {response.text}")
-            return None
-    if message:
-        sledge_games[game_id]["message_id"] = message.json()["result"]["message_id"]
-    
-    # Запускаем анимацию спиннеров
-    start_sledge_animation(game_id)
 
 def start_sledge_animation(game_id):
     """Запускает анимацию спиннеров для игры Санки"""
