@@ -151,7 +151,7 @@ game_analytics = {
     "user_activity": {}
 }
 
-# НОВАЯ ИГРА - САНКИ (RampageBET)
+# НОВАЯ ИГРА - САНКИ 
 sledge_games = {}
 sledge_spins = {}
 
@@ -763,10 +763,10 @@ def get_personal_stats(user_id):
         "sledge_wins": user_data.get("sledge_wins", 0)
     }
 
-# ========== НОВАЯ ИГРА "САНКИ" (RampageBET) ==========
+# ========== НОВАЯ ИГРА "САНКИ"  ==========
 
 def play_sledge_game(user_id, chat_id, bet_amount, currency):
-    """Игра Санки (RampageBET)"""
+    """Игра Санки """
     player = Player(user_id)
     currency_text = "виртуальных монет" if currency == "coins" else "USDT"
     
@@ -799,7 +799,7 @@ def play_sledge_game(user_id, chat_id, bet_amount, currency):
     
     # Отправляем начальное сообщение
     message = send_message(chat_id,
-        f"🎿 <b>RampageBET</b>\n\n"
+        f"🎿 <b>Санки</b>\n\n"
         f"👤 {player.data.get('username', 'Игрок')} ставит {bet_amount} {currency_text}\n\n"
         f"🎯 <b>Санки</b>\n"
         f"Должно выпасть число {target_number}\n\n"
@@ -808,7 +808,26 @@ def play_sledge_game(user_id, chat_id, bet_amount, currency):
         f"⏰ Игра началась...",
         sledge_game_keyboard(game_id)
     )
-    
+
+    def sledge_games (chat_id, emoji="🎲"):
+    """Отправка анимации"""
+    try:
+        params = {"chat_id": chat_id, "emoji": emoji}
+        response = requests.post(URL + "sendDice", json=params, timeout=25)
+        
+        if response.status_code == 200:
+            result = response.json()
+            message_id = result['result']['message_id']
+            game_results[message_id] = {
+                'chat_id': chat_id,
+                'emoji': emoji,
+                'value': result['result']['dice']['value'],
+                'timestamp': time.time()
+            }
+            return result
+        else:
+            logging.error(f"Ошибка отправки кубика: {response.text}")
+            return None
     if message:
         sledge_games[game_id]["message_id"] = message.json()["result"]["message_id"]
     
@@ -841,7 +860,7 @@ def start_sledge_animation(game_id):
         if message_id:
             try:
                 edit_message(chat_id, message_id,
-                    f"🎿 <b>RampageBET</b>\n\n"
+                    f"🎿 <b>Cанки</b>\n\n"
                     f"👤 {player.data.get('username', 'Игрок')} ставит {game['bet_amount']} {currency_text}\n\n"
                     f"🎯 <b>Санки</b>\n"
                     f"Должно выпасть число {game['target_number']}\n\n"
@@ -854,7 +873,7 @@ def start_sledge_animation(game_id):
                 pass
         
         # Имитация спиннера - случайное число
-        spin_result = random.randint(1, 200)
+        spin_result = random.randint(1, 1000)
         sledge_spins[f"{game_id}_spin_{spin}"] = {
             "number": spin_result,
             "is_win": spin_result == game["target_number"],
@@ -929,7 +948,7 @@ def finish_sledge_game(game_id):
     if message_id:
         try:
             edit_message(chat_id, message_id,
-                f"🎿 <b>RampageBET</b>\n\n"
+                f"🎿 <b>Санки</b>\n\n"
                 f"👤 {player.data.get('username', 'Игрок')} ставит {game['bet_amount']} {currency_text}\n\n"
                 f"🎯 <b>Санки</b>\n"
                 f"Должно выпасть число {game['target_number']}\n\n"
@@ -940,7 +959,7 @@ def finish_sledge_game(game_id):
         except:
             # Если не удалось отредактировать, отправляем новое сообщение
             send_message(chat_id,
-                f"🎿 <b>RampageBET - Результат</b>\n\n"
+                f"🎿 <b>Санки - Результат</b>\n\n"
                 f"{result_text}",
                 sledge_game_finished_keyboard()
             )
