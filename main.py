@@ -200,8 +200,8 @@ anti_cheat = AntiCheat()
 
 # ========== НАСТРОЙКИ КАЗИНО ==========
 GAME_SETTINGS = {
-    "min_bet_usdt": 1, "max_bet_usdt": 1000,
-    "min_bet_coins": 10, "max_bet_coins": 10000,
+    "min_bet_usdt": 1, "max_bet_usdt": 1000000,
+    "min_bet_coins": 10, "max_bet_coins": 10000000,
     "house_edge": 0.05, "referral_bonus": 0.03, "welcome_bonus": 500,
     "min_deposit": 1, "min_withdraw": 10,
     "daily_bonus_min": 300, "daily_bonus_max": 500,
@@ -697,7 +697,7 @@ def get_user_balance(user_id):
     
     if user_id_str not in players:
         players[user_id_str] = {
-            "usdt": 0.0, "coins": 100, "games_played": 0, "games_won": 0,
+            "usdt": 0.0, "coins": 2000, "games_played": 0, "games_won": 0,
             "total_winnings": 0, "referral_code": None, "referrals": [],
             "referrer_id": None, "referral_earnings": 0.0, "username": "",
             "referral_balance": 0.0, "game_currency": "coins", "total_bet": 0,
