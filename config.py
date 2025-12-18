@@ -11,10 +11,9 @@ class Config:
     REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
     CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003408636061"))
     
-    # Награды (настраиваются админом)
-    REFERRAL_REWARD = 300  # Награда за реферала
-    JOIN_REWARD = 200      # Награда за переход по ссылке
-    MIN_WITHDRAWAL = 5000  # Минимальный вывод
+    REFERRAL_REWARD = 300
+    JOIN_REWARD = 200
+    MIN_WITHDRAWAL = 5000
+    MARKET_COMMISSION = 15  # 15% комиссия рынка
     
-    # Настройки изображений
     BALANCE_IMAGE = "https://disk.yandex.ru/i/JT8xfr8dWFmVmw"
