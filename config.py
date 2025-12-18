@@ -11,9 +11,11 @@ class Config:
     REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
     CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003408636061"))
     
+    # Награды (стандартные значения, если не заданы в .env)
     REFERRAL_REWARD = 300
     JOIN_REWARD = 200
     MIN_WITHDRAWAL = 5000
-    MARKET_COMMISSION = 20  # 20% комиссия рынка
+    MARKET_COMMISSION = 15  # 15% комиссия рынка
     
+    # URL изображения для баланса
     BALANCE_IMAGE = "https://disk.yandex.ru/i/JT8xfr8dWFmVmw"
