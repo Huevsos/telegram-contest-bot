@@ -1,43 +1,15 @@
 import os
 import logging
-import asyncio
-from typing import Dict, List, Optional
 from datetime import datetime
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-from telegram import (
-    Update, 
-    InlineKeyboardMarkup, 
-    InlineKeyboardButton,
-    ChatMember,
-    InputMediaPhoto
-)
-from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    MessageHandler, 
-    CallbackQueryHandler, 
-    ContextTypes, 
-    filters
-)
-from telegram.constants import ParseMode
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-# ========== КОНФИГУРАЦИЯ ==========
-TOKEN = "8126450707:AAHmAGcyS76RImXRQ6WJBgMxF3JPPl4sduY"
-BOT_USERNAME = "@elon_ref_bot"
-OWNER_ID = 7433757951
-CHANNEL_USERNAME = "@cosinxx_prime"
-CHANNEL_LINK = "https://t.me/cosinxx_prime"
-
-# Настройки золота
-GOLD_PER_REFERRAL = 300
-GOLD_PER_JOIN = 200
-MIN_WITHDRAWAL = 5000
-
-# Настройки базы данных (для Railway)
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/referral_bot')
+# Загрузка переменных окружения
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -46,707 +18,269 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== БАЗА ДАННЫХ ==========
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+# Настройка базы данных (используем SQLite для простоты)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///referral.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-def init_database():
-    """Инициализация таблиц в базе данных"""
-    conn = get_db_connection()
-    cur = conn.cursor()
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+SessionLocal = sessionmaker(bind=engine)
+
+# Модель пользователя
+class User(Base):
+    __tablename__ = 'users'
     
-    # Таблица пользователей
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            username VARCHAR(255),
-            first_name VARCHAR(255),
-            last_name VARCHAR(255),
-            referrer_id BIGINT,
-            gold INTEGER DEFAULT 0,
-            total_earned INTEGER DEFAULT 0,
-            referrals_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            joined_channel BOOLEAN DEFAULT FALSE
-        )
-    ''')
-    
-    # Таблица транзакций
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS transactions (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            amount INTEGER,
-            type VARCHAR(50),
-            description VARCHAR(255),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица выводов
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            amount INTEGER,
-            status VARCHAR(20) DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица настроек (для админа)
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS settings (
-            key VARCHAR(50) PRIMARY KEY,
-            value VARCHAR(255)
-        )
-    ''')
-    
-    # Начальные настройки
-    cur.execute('''
-        INSERT INTO settings (key, value) 
-        VALUES ('gold_per_referral', %s)
-        ON CONFLICT (key) DO NOTHING
-    ''', (str(GOLD_PER_REFERRAL),))
-    
-    cur.execute('''
-        INSERT INTO settings (key, value) 
-        VALUES ('gold_per_join', %s)
-        ON CONFLICT (key) DO NOTHING
-    ''', (str(GOLD_PER_JOIN),))
-    
-    conn.commit()
-    cur.close()
-    conn.close()
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, unique=True, nullable=False)
+    username = Column(String)
+    first_name = Column(String)
+    last_name = Column(String)
+    referral_code = Column(String, unique=True)
+    referred_by = Column(String, nullable=True)
+    balance = Column(Integer, default=0)
+    referrals_count = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-# ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
-def get_user(user_id: int):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
-    return user
+# Создаем таблицы
+Base.metadata.create_all(bind=engine)
 
-def create_user(user_id: int, username: str, first_name: str, last_name: str, referrer_id: Optional[int] = None):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO users (user_id, username, first_name, last_name, referrer_id) 
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET
-        username = EXCLUDED.username,
-        first_name = EXCLUDED.first_name,
-        last_name = EXCLUDED.last_name
-    ''', (user_id, username, first_name, last_name, referrer_id))
-    conn.commit()
-    cur.close()
-    conn.close()
+# Конфигурация
+REFERRAL_BONUS = 50  # Бонус за приглашение
+WELCOME_BONUS = 10   # Бонус новому пользователю
 
-def add_gold(user_id: int, amount: int, transaction_type: str, description: str):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # Обновляем баланс
-    cur.execute('''
-        UPDATE users 
-        SET gold = gold + %s, total_earned = total_earned + %s 
-        WHERE user_id = %s
-    ''', (amount, amount if amount > 0 else 0, user_id))
-    
-    # Записываем транзакцию
-    cur.execute('''
-        INSERT INTO transactions (user_id, amount, type, description)
-        VALUES (%s, %s, %s, %s)
-    ''', (user_id, amount, transaction_type, description))
-    
-    conn.commit()
-    cur.close()
-    conn.close()
+def generate_referral_code(user_id: int) -> str:
+    """Генерация уникального реферального кода"""
+    import hashlib
+    return hashlib.md5(f"referral_{user_id}_{datetime.now().timestamp()}".encode()).hexdigest()[:8]
 
-def update_referrals_count(user_id: int):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        UPDATE users 
-        SET referrals_count = referrals_count + 1 
-        WHERE user_id = %s
-    ''', (user_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def set_joined_channel(user_id: int):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('UPDATE users SET joined_channel = TRUE WHERE user_id = %s', (user_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def create_withdrawal(user_id: int, amount: int):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('INSERT INTO withdrawals (user_id, amount) VALUES (%s, %s)', (user_id, amount))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def get_settings():
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute('SELECT * FROM settings')
-    settings = {row['key']: row['value'] for row in cur.fetchall()}
-    cur.close()
-    conn.close()
-    return settings
-
-def update_setting(key: str, value: str):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO settings (key, value) 
-        VALUES (%s, %s)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-    ''', (key, value))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# ========== КЛАВИАТУРЫ ==========
-def get_main_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("👥 Пригласить друзей", callback_data="invite")],
-        [InlineKeyboardButton("💰 Вывести голду", callback_data="withdraw")],
-        [InlineKeyboardButton("📊 Топ рефералов", callback_data="top")],
-        [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_invite_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    referral_link = f"https://t.me/{BOT_USERNAME[1:]}?start={user_id}"
-    keyboard = [
-        [InlineKeyboardButton("📢 Поделиться ссылкой", 
-         url=f"https://t.me/share/url?url={referral_link}&text=Присоединяйся%20к%20моему%20проекту%20и%20зарабатывай%20голду!")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_withdraw_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton(f"💳 Вывести от {MIN_WITHDRAWAL} голды", callback_data=f"withdraw_{MIN_WITHDRAWAL}")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_admin_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="admin_settings")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="back")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_settings_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("✏️ Голда за реферала", callback_data="set_referral")],
-        [InlineKeyboardButton("✏️ Голда за вступление", callback_data="set_join")],
-        [InlineKeyboardButton("◀️ Назад к админке", callback_data="admin_back")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-# ========== ОСНОВНЫЕ КОМАНДЫ ==========
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    user = update.effective_user
-    user_id = user.id
+    user_data = update.effective_user
+    referral_code = None
     
-    # Получаем параметр реферала
-    args = context.args
-    referrer_id = int(args[0]) if args else None
+    # Проверяем, есть ли реферальный код в аргументах
+    if context.args:
+        referral_code = context.args[0]
     
-    # Проверяем подписку на канал
+    db = SessionLocal()
+    
     try:
-        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        has_subscription = member.status in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]
-    except:
-        has_subscription = False
-    
-    # Создаем или обновляем пользователя
-    create_user(user_id, user.username, user.first_name, user.last_name, referrer_id)
-    
-    # Если есть реферал и пользователь новый (впервые запускает бота)
-    if referrer_id and referrer_id != user_id:
-        referrer = get_user(referrer_id)
-        if referrer:
-            # Начисляем голду рефереру
-            settings = get_settings()
-            gold_amount = int(settings.get('gold_per_referral', GOLD_PER_REFERRAL))
-            
-            add_gold(referrer_id, gold_amount, "referral", f"Реферал: {user.username or user_id}")
-            update_referrals_count(referrer_id)
-            
-            # Уведомляем реферера
-            try:
-                await context.bot.send_message(
-                    chat_id=referrer_id,
-                    text=f"🎉 Новый реферал!\n"
-                         f"Пользователь @{user.username or user.first_name} присоединился по вашей ссылке.\n"
-                         f"📈 Начислено: +{gold_amount} голды"
-                )
-            except:
-                pass
-    
-    # Начисляем голду за вступление в канал
-    if has_subscription:
-        db_user = get_user(user_id)
-        if not db_user['joined_channel']:
-            settings = get_settings()
-            join_gold = int(settings.get('gold_per_join', GOLD_PER_JOIN))
-            
-            add_gold(user_id, join_gold, "channel_join", "Вступление в канал")
-            set_joined_channel(user_id)
-    
-    # Отправляем основное сообщение с фотографией
-    caption = f"👋 Привет, {user.first_name}!\n\n"
-    
-    if not has_subscription:
-        caption += f"⚠️ Для доступа к боту необходимо подписаться на канал: {CHANNEL_LINK}\n\n"
-        caption += "После подписки нажмите /start"
+        # Проверяем, есть ли пользователь в базе
+        user = db.query(User).filter(User.telegram_id == user_data.id).first()
         
-        keyboard = [[InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_LINK)]]
-        await update.message.reply_photo(
-            photo="https://disk.yandex.ru/i/JT8xfr8dWFmVmw",
-            caption=caption,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    # Если подписка есть, показываем основной интерфейс
-    db_user = get_user(user_id)
-    
-    caption += f"💰 Баланс: {db_user['gold']} голды\n"
-    caption += f"👥 Рефералов: {db_user['referrals_count']}\n"
-    caption += f"🎯 Всего заработано: {db_user['total_earned']} голды\n\n"
-    caption += "Используй кнопки ниже для управления:"
-    
-    await update.message.reply_photo(
-        photo="https://disk.yandex.ru/i/JT8xfr8dWFmVmw",
-        caption=caption,
-        reply_markup=get_main_keyboard()
-    )
+        if not user:
+            # Создаем нового пользователя
+            referral_code_new = generate_referral_code(user_data.id)
+            user = User(
+                telegram_id=user_data.id,
+                username=user_data.username,
+                first_name=user_data.first_name,
+                last_name=user_data.last_name,
+                referral_code=referral_code_new
+            )
+            
+            # Если есть реферальный код, находим пригласившего
+            if referral_code:
+                referrer = db.query(User).filter(User.referral_code == referral_code).first()
+                if referrer:
+                    user.referred_by = referrer.telegram_id
+                    referrer.balance += REFERRAL_BONUS
+                    referrer.referrals_count += 1
+                    user.balance += WELCOME_BONUS
+            
+            db.add(user)
+            db.commit()
+            
+            welcome_text = f"""
+👋 Привет, {user_data.first_name}!
 
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает баланс пользователя"""
-    user = update.effective_user
-    db_user = get_user(user.id)
+🎉 Добро пожаловать в нашего бота!
+💰 Твой баланс: {user.balance} баллов
+
+📋 Доступные команды:
+/start - Начало работы
+/profile - Мой профиль
+/referral - Моя реферальная ссылка
+/balance - Мой баланс
+            """
+            
+            if referral_code:
+                welcome_text += f"\n✅ Ты зарегистрировался по реферальной ссылке!"
+            
+        else:
+            welcome_text = f"""
+👋 С возвращением, {user_data.first_name}!
+
+📋 Доступные команды:
+/profile - Мой профиль
+/referral - Моя реферальная ссылка
+/balance - Мой баланс
+            """
+        
+        await update.message.reply_text(welcome_text)
+        
+    except Exception as e:
+        logger.error(f"Error in start command: {e}")
+        await update.message.reply_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
+    finally:
+        db.close()
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать профиль пользователя"""
+    db = SessionLocal()
+    user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
     
-    if not db_user:
-        await update.message.reply_text("Сначала используйте /start")
-        return
-    
-    text = f"💰 Ваш баланс: {db_user['gold']} голды\n"
-    text += f"👥 Приглашено друзей: {db_user['referrals_count']}\n"
-    text += f"🎯 Всего заработано: {db_user['total_earned']} голды\n\n"
-    
-    if db_user['gold'] >= MIN_WITHDRAWAL:
-        text += f"✅ Вы можете вывести от {MIN_WITHDRAWAL} голды"
+    if user:
+        profile_text = f"""
+📊 Ваш профиль:
+
+👤 Имя: {user.first_name} {user.last_name or ''}
+🆔 ID: {user.telegram_id}
+💰 Баланс: {user.balance} баллов
+👥 Приглашено друзей: {user.referrals_count}
+🔗 Реферальный код: {user.referral_code}
+📅 Дата регистрации: {user.created_at.strftime('%d.%m.%Y')}
+        """
+        
+        keyboard = [
+            [InlineKeyboardButton("📢 Поделиться ссылкой", 
+                                 switch_inline_query=f"Присоединяйся! Используй мой код: {user.referral_code}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(profile_text, reply_markup=reply_markup)
     else:
-        text += f"❌ Для вывода необходимо минимум {MIN_WITHDRAWAL} голды"
+        await update.message.reply_text("Пользователь не найден. Используйте /start")
     
-    await update.message.reply_text(text, reply_markup=get_withdraw_keyboard())
+    db.close()
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда помощи"""
-    text = "📚 *Помощь по боту*\n\n"
-    text += "🎯 *Как зарабатывать голду?*\n"
-    text += "1. Приглашайте друзей по реферальной ссылке\n"
-    text += "2. Каждый приглашенный друг принесет вам голду\n"
-    text += "3. Новые пользователи также получают голду за вступление в канал\n\n"
-    text += "💰 *Вывод голды*\n"
-    text += f"- Минимальная сумма вывода: {MIN_WITHDRAWAL} голды\n"
-    text += "- Вывод осуществляется на указанные реквизиты\n\n"
-    text += "⚡ *Быстрые команды:*\n"
-    text += "/start - Запустить бота\n"
-    text += "/balance - Показать баланс\n"
-    text += "/help - Эта справка"
+async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать реферальную ссылку"""
+    db = SessionLocal()
+    user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
     
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    if user:
+        bot_username = (await context.bot.get_me()).username
+        referral_link = f"https://t.me/{bot_username}?start={user.referral_code}"
+        
+        referral_text = f"""
+🎯 Ваша реферальная система:
 
-# ========== ADMIN COMMANDS ==========
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ панель"""
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде")
-        return
-    
-    text = "⚡ *Админ панель*\n\n"
-    text += "Выберите действие:"
-    
-    await update.message.reply_text(
-        text, 
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=get_admin_keyboard()
-    )
+🔗 Ваша ссылка:
+{referral_link}
 
-async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика бота для админа"""
-    if update.effective_user.id != OWNER_ID:
-        return
-    
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # Общая статистика
-    cur.execute('SELECT COUNT(*) as total_users FROM users')
-    total_users = cur.fetchone()['total_users']
-    
-    cur.execute('SELECT SUM(gold) as total_gold FROM users')
-    total_gold = cur.fetchone()['total_gold'] or 0
-    
-    cur.execute('SELECT SUM(total_earned) as total_earned FROM users')
-    total_earned = cur.fetchone()['total_earned'] or 0
-    
-    # Топ рефералов
-    cur.execute('''
-        SELECT username, referrals_count, total_earned 
-        FROM users 
-        WHERE referrals_count > 0 
-        ORDER BY referrals_count DESC 
-        LIMIT 10
-    ''')
-    top_referrers = cur.fetchall()
-    
-    cur.close()
-    conn.close()
-    
-    # Формируем сообщение
-    text = f"📊 *Статистика бота*\n\n"
-    text += f"👥 Всего пользователей: {total_users}\n"
-    text += f"💰 Всего голды в системе: {total_gold}\n"
-    text += f"🎯 Всего выдано голды: {total_earned}\n\n"
-    
-    if top_referrers:
-        text += "🏆 *Топ 10 рефералов:*\n"
-        for i, user in enumerate(top_referrers, 1):
-            username = user['username'] or f"ID:{user['user_id']}"
-            text += f"{i}. @{username} - {user['referrals_count']} реф. ({user['total_earned']} голды)\n"
-    
-    await update.callback_query.message.edit_text(
-        text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]])
-    )
+🔢 Ваш код:
+`{user.referral_code}`
 
-# ========== CALLBACK HANDLERS ==========
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик inline кнопок"""
+💰 Награды:
+• Вы получаете: {REFERRAL_BONUS} баллов за каждого приглашенного
+• Друг получает: {WELCOME_BONUS} баллов при регистрации
+
+📢 Поделитесь ссылкой с друзьями и получайте бонусы!
+        """
+        
+        keyboard = [
+            [InlineKeyboardButton("🔗 Поделиться ссылкой", url=f"tg://msg_url?url={referral_link}&text=Присоединяйся%20к%20нам!")],
+            [InlineKeyboardButton("📋 Мой профиль", callback_data="profile")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(referral_text, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+        await update.message.reply_text("Пользователь не найден. Используйте /start")
+    
+    db.close()
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать баланс"""
+    db = SessionLocal()
+    user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+    
+    if user:
+        balance_text = f"""
+💰 Ваш баланс: {user.balance} баллов
+
+🎁 Вы пригласили: {user.referrals_count} друзей
+📈 Всего заработано: {user.referrals_count * REFERRAL_BONUS} баллов
+
+💡 Приглашайте друзей и получайте бонусы!
+        """
+        await update.message.reply_text(balance_text)
+    else:
+        await update.message.reply_text("Пользователь не найден. Используйте /start")
+    
+    db.close()
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
     
-    user_id = query.from_user.id
-    callback_data = query.data
-    
-    # Проверяем подписку
-    try:
-        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        has_subscription = member.status in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]
-    except:
-        has_subscription = False
-    
-    if not has_subscription and not callback_data.startswith("admin"):
-        await query.edit_message_caption(
-            caption=f"⚠️ Для доступа к боту необходимо подписаться на канал: {CHANNEL_LINK}\n\nПосле подписки нажмите /start",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_LINK)]])
-        )
+    if query.data == "profile":
+        await profile(update, context)
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика (только для админа)"""
+    admin_id = os.getenv("ADMIN_ID")
+    if not admin_id or str(update.effective_user.id) != admin_id:
+        await update.message.reply_text("Эта команда доступна только администратору.")
         return
     
-    if callback_data == "back":
-        # Возврат в главное меню
-        db_user = get_user(user_id)
-        caption = f"💰 Баланс: {db_user['gold']} голды\n"
-        caption += f"👥 Рефералов: {db_user['referrals_count']}\n"
-        caption += f"🎯 Всего заработано: {db_user['total_earned']} голды\n\n"
-        caption += "Используй кнопки ниже для управления:"
-        
-        await query.edit_message_caption(
-            caption=caption,
-            reply_markup=get_main_keyboard()
-        )
+    db = SessionLocal()
+    total_users = db.query(User).count()
+    total_referrals = db.query(User).filter(User.referrals_count > 0).count()
+    active_users = db.query(User).filter(User.is_active == True).count()
     
-    elif callback_data == "invite":
-        # Приглашение друзей
-        db_user = get_user(user_id)
-        referral_link = f"https://t.me/{BOT_USERNAME[1:]}?start={user_id}"
-        
-        text = f"👥 *Пригласить друзей*\n\n"
-        text += f"🔗 Ваша реферальная ссылка:\n`{referral_link}`\n\n"
-        text += f"💰 За каждого приглашенного друга вы получите {GOLD_PER_REFERRAL} голды\n"
-        text += f"🎁 Ваш друг получит {GOLD_PER_JOIN} голды за вступление в канал\n\n"
-        text += f"👥 Приглашено: {db_user['referrals_count']} друзей\n"
-        text += f"🎯 Заработано с рефералов: {db_user['total_earned']} голды"
-        
-        await query.edit_message_caption(
-            caption=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_invite_keyboard(user_id)
-        )
-    
-    elif callback_data == "withdraw":
-        # Вывод голды
-        db_user = get_user(user_id)
-        
-        text = f"💰 *Вывод голды*\n\n"
-        text += f"📊 Ваш баланс: {db_user['gold']} голды\n"
-        text += f"💳 Минимальная сумма вывода: {MIN_WITHDRAWAL} голды\n\n"
-        
-        if db_user['gold'] >= MIN_WITHDRAWAL:
-            text += "✅ Вы можете вывести голду!\n"
-            text += "📝 Для вывода напишите @cosinxx_prime"
-        else:
-            text += f"❌ Недостаточно голды для вывода\n"
-            text += f"🔢 Необходимо еще {MIN_WITHDRAWAL - db_user['gold']} голды"
-        
-        await query.edit_message_caption(
-            caption=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_withdraw_keyboard()
-        )
-    
-    elif callback_data.startswith("withdraw_"):
-        # Обработка вывода
-        amount = int(callback_data.split("_")[1])
-        db_user = get_user(user_id)
-        
-        if db_user['gold'] >= amount:
-            # Создаем заявку на вывод
-            create_withdrawal(user_id, amount)
-            
-            # Списание голды
-            add_gold(user_id, -amount, "withdrawal", "Вывод голды")
-            
-            text = f"✅ Заявка на вывод {amount} голды создана!\n\n"
-            text += "📞 Свяжитесь с @cosinxx_prime для получения средств"
-            
-            # Уведомляем админа
-            try:
-                await context.bot.send_message(
-                    chat_id=OWNER_ID,
-                    text=f"📤 Новая заявка на вывод!\n\n"
-                         f"👤 Пользователь: @{query.from_user.username or query.from_user.id}\n"
-                         f"💰 Сумма: {amount} голды\n"
-                         f"📊 Баланс после: {db_user['gold'] - amount} голды"
-                )
-            except:
-                pass
-        else:
-            text = f"❌ Недостаточно голды!\n"
-            text += f"💰 Ваш баланс: {db_user['gold']} голды\n"
-            text += f"🔢 Требуется: {amount} голды"
-        
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_withdraw_keyboard()
-        )
-    
-    elif callback_data == "top":
-        # Топ рефералов
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cur.execute('''
-            SELECT username, referrals_count, total_earned 
-            FROM users 
-            WHERE referrals_count > 0 
-            ORDER BY referrals_count DESC 
-            LIMIT 10
-        ''')
-        top_users = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
-        text = "🏆 *Топ рефералов*\n\n"
-        
-        if top_users:
-            for i, user in enumerate(top_users, 1):
-                username = user['username'] or "Аноним"
-                text += f"{i}. @{username}\n"
-                text += f"   👥 {user['referrals_count']} реф. | 💰 {user['total_earned']} голды\n\n"
-        else:
-            text += "Пока нет активных рефералов\n"
-            text += "Станьте первым!\n\n"
-        
-        text += "💡 *Как попасть в топ?*\n"
-        text += "Приглашайте друзей и зарабатывайте голду!"
-        
-        await query.edit_message_caption(
-            caption=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back")]])
-        )
-    
-    elif callback_data == "help":
-        # Помощь
-        text = "📚 *Помощь по боту*\n\n"
-        text += "🎯 *Как зарабатывать голду?*\n"
-        text += "1. Приглашайте друзей по реферальной ссылке\n"
-        text += "2. Каждый приглашенный друг принесет вам голду\n"
-        text += "3. Новые пользователи также получают голду за вступление в канал\n\n"
-        text += "💰 *Вывод голды*\n"
-        text += f"- Минимальная сумма вывода: {MIN_WITHDRAWAL} голды\n"
-        text += "- Вывод осуществляется на указанные реквизиты\n\n"
-        text += "⚡ *Быстрые команды:*\n"
-        text += "/start - Запустить бота\n"
-        text += "/balance - Показать баланс\n"
-        text += "/help - Эта справка"
-        
-        await query.edit_message_caption(
-            caption=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back")]])
-        )
-    
-    elif callback_data == "admin_settings":
-        # Настройки админа
-        if user_id != OWNER_ID:
-            return
-        
-        settings = get_settings()
-        
-        text = "⚙️ *Настройки бота*\n\n"
-        text += f"💰 Голда за реферала: {settings.get('gold_per_referral', GOLD_PER_REFERRAL)}\n"
-        text += f"🎁 Голда за вступление: {settings.get('gold_per_join', GOLD_PER_JOIN)}\n"
-        text += f"💳 Мин. вывод: {MIN_WITHDRAWAL}\n\n"
-        text += "Выберите параметр для изменения:"
-        
-        await query.edit_message_caption(
-            caption=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_settings_keyboard()
-        )
-    
-    elif callback_data == "set_referral":
-        # Изменение голды за реферала
-        if user_id != OWNER_ID:
-            return
-        
-        text = "✏️ *Изменение голды за реферала*\n\n"
-        text += "Введите новое количество голды (только число):"
-        
-        await query.edit_message_caption(
-            caption=text,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        context.user_data['awaiting_setting'] = 'gold_per_referral'
-    
-    elif callback_data == "set_join":
-        # Изменение голды за вступление
-        if user_id != OWNER_ID:
-            return
-        
-        text = "✏️ *Изменение голды за вступление*\n\n"
-        text += "Введите новое количество голды (только число):"
-        
-        await query.edit_message_caption(
-            caption=text,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        context.user_data['awaiting_setting'] = 'gold_per_join'
-    
-    elif callback_data == "admin_back":
-        # Назад в админ панель
-        if user_id != OWNER_ID:
-            return
-        
-        text = "⚡ *Админ панель*\n\n"
-        text += "Выберите действие:"
-        
-        await query.edit_message_caption(
-            caption=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_admin_keyboard()
-        )
-    
-    elif callback_data == "admin_stats":
-        # Статистика админа
-        await admin_stats_command(update, context)
+    stats_text = f"""
+📊 Статистика бота:
 
-# ========== ОБРАБОТЧИК СООБЩЕНИЙ ==========
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
-    user_id = update.effective_user.id
-    message_text = update.message.text
+👥 Всего пользователей: {total_users}
+✅ Активных пользователей: {active_users}
+👥 Пользователей с рефералами: {total_referrals}
+📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+        """
     
-    # Проверяем, ожидаем ли мы настройку от админа
-    if user_id == OWNER_ID and 'awaiting_setting' in context.user_data:
-        setting_key = context.user_data.pop('awaiting_setting', None)
-        
-        if setting_key and message_text.isdigit():
-            new_value = int(message_text)
-            update_setting(setting_key, str(new_value))
-            
-            text = f"✅ Настройка обновлена!\n"
-            
-            if setting_key == 'gold_per_referral':
-                text += f"Голда за реферала изменена на: {new_value}"
-            elif setting_key == 'gold_per_join':
-                text += f"Голда за вступление изменена на: {new_value}"
-            
-            await update.message.reply_text(
-                text,
-                reply_markup=get_settings_keyboard()
-            )
-            return
-    
-    # Обычное сообщение - перенаправляем в главное меню
-    await start_command(update, context)
+    await update.message.reply_text(stats_text)
+    db.close()
 
-# ========== ОШИБКИ ==========
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.error(f"Ошибка: {context.error}")
-    
-    if update and update.effective_user:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text="⚠️ Произошла ошибка. Пожалуйста, попробуйте еще раз."
-            )
-        except:
-            pass
-
-# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main():
     """Запуск бота"""
-    # Инициализация базы данных
-    init_database()
+    # Получаем токен из переменных окружения
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not TOKEN:
+        raise ValueError("Не установлен TELEGRAM_BOT_TOKEN")
     
-    # Создание приложения
-    app = Application.builder().token(TOKEN).build()
+    # Создаем приложение
+    application = Application.builder().token(TOKEN).build()
     
-    # Регистрация обработчиков команд
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("balance", balance_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("admin", admin_command))
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("profile", profile))
+    application.add_handler(CommandHandler("referral", referral))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CallbackQueryHandler(button_callback))
     
-    # Регистрация обработчиков кнопок
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    # Запускаем бота
+    port = int(os.getenv("PORT", 8443))
     
-    # Регистрация обработчика сообщений
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Регистрация обработчика ошибок
-    app.add_error_handler(error_handler)
-    
-    # Запуск бота
-    print(f"🤖 Бот запущен: @{BOT_USERNAME[1:]}")
-    print(f"👑 Владелец: {OWNER_ID}")
-    print(f"📢 Канал: {CHANNEL_USERNAME}")
-    
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        # На Railway
+        webhook_url = os.getenv("RAILWAY_STATIC_URL", "")
+        if webhook_url:
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=TOKEN,
+                webhook_url=f"{webhook_url}/{TOKEN}"
+            )
+        else:
+            application.run_polling()
+    else:
+        # Локально
+        application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
