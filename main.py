@@ -1,1106 +1,752 @@
-import asyncio
-import logging
 import os
+import logging
+import asyncio
+from typing import Dict, List, Optional
 from datetime import datetime
-from typing import Optional
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, URLInputFile
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-import asyncpg
 
-from config import Config
+from telegram import (
+    Update, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton,
+    ChatMember,
+    InputMediaPhoto
+)
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    CallbackQueryHandler, 
+    ContextTypes, 
+    filters
+)
+from telegram.constants import ParseMode
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# ========== КОНФИГУРАЦИЯ ==========
+TOKEN = "8126450707:AAHmAGcyS76RImXRQ6WJBgMxF3JPPl4sduY"
+BOT_USERNAME = "@elon_ref_bot"
+OWNER_ID = 7433757951
+CHANNEL_USERNAME = "@cosinxx_prime"
+CHANNEL_LINK = "https://t.me/cosinxx_prime"
+
+# Настройки золота
+GOLD_PER_REFERRAL = 300
+GOLD_PER_JOIN = 200
+MIN_WITHDRAWAL = 5000
+
+# Настройки базы данных (для Railway)
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/referral_bot')
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
-bot = Bot(token=Config.BOT_TOKEN)
-dp = Dispatcher()
-
-# ========== СОСТОЯНИЯ ДЛЯ FSM ==========
-
-class WithdrawalStates(StatesGroup):
-    waiting_for_amount = State()
-    waiting_for_skin_photo = State()
-    waiting_for_market_link = State()
-    confirm_withdrawal = State()
-
-class AdminStates(StatesGroup):
-    waiting_for_referral_reward = State()
-    waiting_for_join_reward = State()
-    waiting_for_min_withdrawal = State()
-
 # ========== БАЗА ДАННЫХ ==========
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-async def init_db():
-    """Инициализация базы данных"""
-    conn = await asyncpg.connect(Config.DATABASE_URL)
+def init_database():
+    """Инициализация таблиц в базе данных"""
+    conn = get_db_connection()
+    cur = conn.cursor()
     
-    await conn.execute('''
+    # Таблица пользователей
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            referrals INTEGER DEFAULT 0,
+            username VARCHAR(255),
+            first_name VARCHAR(255),
+            last_name VARCHAR(255),
+            referrer_id BIGINT,
             gold INTEGER DEFAULT 0,
-            referrer_id BIGINT,
-            is_subscribed BOOLEAN DEFAULT FALSE,
-            last_check TIMESTAMP,
-            FOREIGN KEY (referrer_id) REFERENCES users(user_id)
+            total_earned INTEGER DEFAULT 0,
+            referrals_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            joined_channel BOOLEAN DEFAULT FALSE
         )
     ''')
     
-    await conn.execute('''
-        CREATE TABLE IF NOT EXISTS referral_stats (
+    # Таблица транзакций
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
             id SERIAL PRIMARY KEY,
-            referrer_id BIGINT,
-            referred_id BIGINT,
-            referred_username TEXT,
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            gold_awarded INTEGER DEFAULT 300,
-            FOREIGN KEY (referrer_id) REFERENCES users(user_id),
-            FOREIGN KEY (referred_id) REFERENCES users(user_id)
+            user_id BIGINT,
+            amount INTEGER,
+            type VARCHAR(50),
+            description VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    await conn.execute('''
+    # Таблица выводов
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS withdrawals (
             id SERIAL PRIMARY KEY,
             user_id BIGINT,
-            username TEXT,
             amount INTEGER,
-            commission INTEGER DEFAULT 15,
-            final_amount INTEGER,
-            skin_photo TEXT,
-            market_link TEXT,
-            status TEXT DEFAULT 'pending',
-            request_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            processed_date TIMESTAMP,
-            admin_id BIGINT,
-            admin_comment TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(user_id)
+            status VARCHAR(20) DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
-    await conn.execute('''
-        CREATE TABLE IF NOT EXISTS reward_settings (
-            id SERIAL PRIMARY KEY,
-            referral_reward INTEGER DEFAULT 300,
-            join_reward INTEGER DEFAULT 200,
-            min_withdrawal INTEGER DEFAULT 5000,
-            updated_by BIGINT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    # Таблица настроек (для админа)
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key VARCHAR(50) PRIMARY KEY,
+            value VARCHAR(255)
         )
     ''')
     
-    settings = await conn.fetchrow('SELECT * FROM reward_settings LIMIT 1')
-    if not settings:
-        await conn.execute('''
-            INSERT INTO reward_settings (referral_reward, join_reward, min_withdrawal, updated_by)
-            VALUES ($1, $2, $3, $4)
-        ''', Config.REFERRAL_REWARD, Config.JOIN_REWARD, Config.MIN_WITHDRAWAL, Config.OWNER_ID)
+    # Начальные настройки
+    cur.execute('''
+        INSERT INTO settings (key, value) 
+        VALUES ('gold_per_referral', %s)
+        ON CONFLICT (key) DO NOTHING
+    ''', (str(GOLD_PER_REFERRAL),))
     
-    await conn.close()
-    logger.info("База данных инициализирована")
+    cur.execute('''
+        INSERT INTO settings (key, value) 
+        VALUES ('gold_per_join', %s)
+        ON CONFLICT (key) DO NOTHING
+    ''', (str(GOLD_PER_JOIN),))
+    
+    conn.commit()
+    cur.close()
+    conn.close()
 
-async def get_db():
-    """Получение соединения с БД"""
-    return await asyncpg.connect(Config.DATABASE_URL)
-
-async def get_reward_settings():
-    """Получение текущих настроек наград"""
-    conn = await get_db()
-    settings = await conn.fetchrow('SELECT * FROM reward_settings ORDER BY id DESC LIMIT 1')
-    await conn.close()
-    return settings
-
-async def check_subscription(user_id: int) -> bool:
-    """Проверка подписки на канал"""
-    try:
-        member = await bot.get_chat_member(Config.CHANNEL_ID, user_id)
-        return member.status in ['member', 'administrator', 'creator']
-    except Exception as e:
-        logger.error(f"Ошибка проверки подписки: {e}")
-        return False
-
-async def get_or_create_user(user_id, username=None, full_name=None, referrer_id=None):
-    """Получение или создание пользователя"""
-    conn = await get_db()
-    
-    settings = await get_reward_settings()
-    
-    user = await conn.fetchrow(
-        'SELECT * FROM users WHERE user_id = $1',
-        user_id
-    )
-    
-    if not user:
-        is_subscribed = await check_subscription(user_id)
-        
-        await conn.execute('''
-            INSERT INTO users (user_id, username, full_name, referrer_id, is_subscribed)
-            VALUES ($1, $2, $3, $4, $5)
-        ''', user_id, username, full_name, referrer_id, is_subscribed)
-        
-        if referrer_id and referrer_id != user_id and is_subscribed:
-            await conn.execute('''
-                UPDATE users 
-                SET referrals = referrals + 1, 
-                    gold = gold + $1
-                WHERE user_id = $2
-            ''', settings['referral_reward'], referrer_id)
-            
-            await conn.execute('''
-                INSERT INTO referral_stats (referrer_id, referred_id, referred_username, gold_awarded)
-                VALUES ($1, $2, $3, $4)
-            ''', referrer_id, user_id, username, settings['referral_reward'])
-            
-            await conn.execute('''
-                UPDATE users 
-                SET gold = gold + $1
-                WHERE user_id = $2
-            ''', settings['join_reward'], user_id)
-    
-    user = await conn.fetchrow(
-        'SELECT * FROM users WHERE user_id = $1',
-        user_id
-    )
-    
-    await conn.close()
+# ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
+def get_user(user_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
     return user
 
-async def update_user_subscription(user_id, status):
-    """Обновление статуса подписки"""
-    conn = await get_db()
-    await conn.execute(
-        'UPDATE users SET is_subscribed = $1, last_check = CURRENT_TIMESTAMP WHERE user_id = $2',
-        status, user_id
-    )
-    await conn.close()
+def create_user(user_id: int, username: str, first_name: str, last_name: str, referrer_id: Optional[int] = None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO users (user_id, username, first_name, last_name, referrer_id) 
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+        username = EXCLUDED.username,
+        first_name = EXCLUDED.first_name,
+        last_name = EXCLUDED.last_name
+    ''', (user_id, username, first_name, last_name, referrer_id))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-async def get_user_referrals(user_id):
-    """Получение рефералов пользователя"""
-    conn = await get_db()
-    referrals = await conn.fetch(
-        '''
-        SELECT rs.*, u.username, u.full_name 
-        FROM referral_stats rs
-        LEFT JOIN users u ON rs.referred_id = u.user_id
-        WHERE rs.referrer_id = $1
-        ORDER BY rs.date DESC
-        ''',
-        user_id
-    )
-    await conn.close()
-    return referrals
+def add_gold(user_id: int, amount: int, transaction_type: str, description: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Обновляем баланс
+    cur.execute('''
+        UPDATE users 
+        SET gold = gold + %s, total_earned = total_earned + %s 
+        WHERE user_id = %s
+    ''', (amount, amount if amount > 0 else 0, user_id))
+    
+    # Записываем транзакцию
+    cur.execute('''
+        INSERT INTO transactions (user_id, amount, type, description)
+        VALUES (%s, %s, %s, %s)
+    ''', (user_id, amount, transaction_type, description))
+    
+    conn.commit()
+    cur.close()
+    conn.close()
 
-async def get_pending_withdrawals():
-    """Получение ожидающих выводов"""
-    conn = await get_db()
-    withdrawals = await conn.fetch(
-        '''
-        SELECT w.*, u.username, u.full_name 
-        FROM withdrawals w
-        LEFT JOIN users u ON w.user_id = u.user_id
-        WHERE w.status = 'pending'
-        ORDER BY w.request_date
-        '''
-    )
-    await conn.close()
-    return withdrawals
+def update_referrals_count(user_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        UPDATE users 
+        SET referrals_count = referrals_count + 1 
+        WHERE user_id = %s
+    ''', (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-async def update_withdrawal_status(withdrawal_id, status, admin_id=None, comment=None):
-    """Обновление статуса вывода"""
-    conn = await get_db()
-    
-    if status == 'approved':
-        await conn.execute('''
-            UPDATE withdrawals 
-            SET status = $1, processed_date = CURRENT_TIMESTAMP, 
-                admin_id = $2, admin_comment = $3
-            WHERE id = $4
-        ''', status, admin_id, comment, withdrawal_id)
-        
-        withdrawal = await conn.fetchrow(
-            'SELECT user_id, amount FROM withdrawals WHERE id = $1',
-            withdrawal_id
-        )
-        
-        if withdrawal:
-            await conn.execute('''
-                UPDATE users SET gold = gold - $1 WHERE user_id = $2
-            ''', withdrawal['amount'], withdrawal['user_id'])
-    
-    elif status == 'rejected':
-        await conn.execute('''
-            UPDATE withdrawals 
-            SET status = $1, processed_date = CURRENT_TIMESTAMP, 
-                admin_id = $2, admin_comment = $3
-            WHERE id = $4
-        ''', status, admin_id, comment, withdrawal_id)
-    
-    await conn.close()
-    return True
+def set_joined_channel(user_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET joined_channel = TRUE WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def create_withdrawal(user_id: int, amount: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO withdrawals (user_id, amount) VALUES (%s, %s)', (user_id, amount))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_settings():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM settings')
+    settings = {row['key']: row['value'] for row in cur.fetchall()}
+    cur.close()
+    conn.close()
+    return settings
+
+def update_setting(key: str, value: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO settings (key, value) 
+        VALUES (%s, %s)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    ''', (key, value))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # ========== КЛАВИАТУРЫ ==========
+def get_main_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("👥 Пригласить друзей", callback_data="invite")],
+        [InlineKeyboardButton("💰 Вывести голду", callback_data="withdraw")],
+        [InlineKeyboardButton("📊 Топ рефералов", callback_data="top")],
+        [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def get_main_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="👥 Мои рефералы", callback_data="my_referrals"),
-        InlineKeyboardButton(text="💰 Баланс", callback_data="balance")
-    )
-    builder.row(
-        InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
-        InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🎁 Реф. ссылка", callback_data="ref_link"),
-        InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_subscription")
-    )
-    return builder.as_markup()
+def get_invite_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    referral_link = f"https://t.me/{BOT_USERNAME[1:]}?start={user_id}"
+    keyboard = [
+        [InlineKeyboardButton("📢 Поделиться ссылкой", 
+         url=f"https://t.me/share/url?url={referral_link}&text=Присоединяйся%20к%20моему%20проекту%20и%20зарабатывай%20голду!")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def get_withdrawal_keyboard(user_gold, min_withdrawal):
-    builder = InlineKeyboardBuilder()
-    if user_gold >= min_withdrawal:
-        builder.row(
-            InlineKeyboardButton(text="💳 Вывести от 5000 голды", callback_data="withdraw_start")
-        )
-    builder.row(
-        InlineKeyboardButton(text="💰 Баланс", callback_data="balance"),
-        InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")
-    )
-    return builder.as_markup()
+def get_withdraw_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(f"💳 Вывести от {MIN_WITHDRAWAL} голды", callback_data=f"withdraw_{MIN_WITHDRAWAL}")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def get_admin_withdrawal_keyboard(withdrawal_id):
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"admin_approve_{withdrawal_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin_reject_{withdrawal_id}")
-    )
-    builder.row(
-        InlineKeyboardButton(text="📋 Все заявки", callback_data="admin_withdrawals")
-    )
-    return builder.as_markup()
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="admin_settings")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# ========== ПРОВЕРКА ПОДПИСКИ ==========
+def get_settings_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("✏️ Голда за реферала", callback_data="set_referral")],
+        [InlineKeyboardButton("✏️ Голда за вступление", callback_data="set_join")],
+        [InlineKeyboardButton("◀️ Назад к админке", callback_data="admin_back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-async def check_subscription_middleware(user_id, message=None, callback=None):
-    """Проверка подписки перед выполнением действий"""
-    is_subscribed = await check_subscription(user_id)
+# ========== ОСНОВНЫЕ КОМАНДЫ ==========
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user = update.effective_user
+    user_id = user.id
     
-    if not is_subscribed:
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(
-                text="📢 Подписаться на канал",
-                url=f"https://t.me/{Config.REQUIRED_CHANNEL.replace('@', '')}"
-            )
-        )
-        keyboard.row(
-            InlineKeyboardButton(text="✅ Я подписался", callback_data="check_subscription")
-        )
-        
-        text = f"""
-⚠️ <b>Требуется подписка!</b>
-
-Для использования бота необходимо подписаться на канал:
-{Config.REQUIRED_CHANNEL}
-
-После подписки нажмите кнопку "✅ Я подписался"
-        """
-        
-        if message:
-            await message.answer(text, parse_mode="HTML", reply_markup=keyboard.as_markup())
-        elif callback:
-            await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard.as_markup())
-        
-        await update_user_subscription(user_id, False)
-        return False
+    # Получаем параметр реферала
+    args = context.args
+    referrer_id = int(args[0]) if args else None
     
-    await update_user_subscription(user_id, True)
-    return True
-
-# ========== КОМАНДЫ ==========
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    
-    user_id = message.from_user.id
-    args = message.text.split()
-    
-    referrer_id = None
-    if len(args) > 1 and args[1].isdigit():
-        referrer_id = int(args[1])
-        logger.info(f"Пользователь {user_id} перешел по ссылке от {referrer_id}")
-    
-    user = await get_or_create_user(
-        user_id=user_id,
-        username=message.from_user.username,
-        full_name=message.from_user.full_name,
-        referrer_id=referrer_id
-    )
-    
-    if not await check_subscription_middleware(user_id, message=message):
-        return
-    
-    settings = await get_reward_settings()
-    if referrer_id and referrer_id != user_id and user['is_subscribed']:
-        welcome_bonus_text = f"""
-🎉 Вы перешли по реферальной ссылке!
-➕ Получено: {settings['join_reward']} голды 🥇
-👤 Пригласивший получает {settings['referral_reward']} голды
-        """
-        await message.answer(welcome_bonus_text, parse_mode="HTML")
-    
-    ref_link = f"https://t.me/{Config.BOT_USERNAME}?start={user_id}"
-    
-    welcome_text = f"""
-🎉 Добро пожаловать, {message.from_user.full_name}!
-
-🤖 <b>Elon Referral Bot</b>
-
-📌 <b>Ваша реферальная ссылка:</b>
-<code>{ref_link}</code>
-
-💰 <b>Награды:</b>
-• За реферала: {settings['referral_reward']} голды 🥇
-• За переход по ссылке: {settings['join_reward']} голды 🥇
-• Минимальный вывод: {settings['min_withdrawal']} голды 🥇
-
-👇 <b>Используйте кнопки ниже:</b>
-    """
-    
-    await message.answer(welcome_text, parse_mode="HTML", reply_markup=get_main_keyboard())
-
-@dp.message(Command("menu"))
-async def cmd_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("📱 <b>Главное меню</b>", parse_mode="HTML", reply_markup=get_main_keyboard())
-
-# ========== ОБРАБОТКА КНОПОК ==========
-
-@dp.callback_query(F.data == "balance")
-async def callback_balance(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    
-    if not await check_subscription_middleware(user_id, callback=callback):
-        await callback.answer()
-        return
-    
-    user = await get_or_create_user(user_id)
-    settings = await get_reward_settings()
-    
+    # Проверяем подписку на канал
     try:
-        photo = URLInputFile(Config.BALANCE_IMAGE)
-        await bot.send_photo(
-            chat_id=callback.message.chat.id,
-            photo=photo,
-            caption=f"""
-💰 <b>Ваш баланс:</b> {user['gold']} голды 🥇
-
-💳 <b>Доступно для вывода:</b> {user['gold']} голды 🥇
-🎯 <b>Минимальный вывод:</b> {settings['min_withdrawal']} голды 🥇
-📊 <b>Рефералов:</b> {user['referrals']}
-            """,
-            parse_mode="HTML",
-            reply_markup=get_withdrawal_keyboard(user['gold'], settings['min_withdrawal'])
-        )
-    except Exception as e:
-        logger.error(f"Ошибка загрузки изображения: {e}")
-        text = f"""
-💰 <b>Ваш баланс:</b> {user['gold']} голды 🥇
-
-💳 <b>Доступно для вывода:</b> {user['gold']} голды 🥇
-🎯 <b>Минимальный вывод:</b> {settings['min_withdrawal']} голды 🥇
-📊 <b>Рефералов:</b> {user['referrals']}
-        """
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=get_withdrawal_keyboard(user['gold'], settings['min_withdrawal']))
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        has_subscription = member.status in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+    except:
+        has_subscription = False
     
-    await callback.answer()
-
-@dp.callback_query(F.data == "stats")
-async def callback_stats(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
+    # Создаем или обновляем пользователя
+    create_user(user_id, user.username, user.first_name, user.last_name, referrer_id)
     
-    if not await check_subscription_middleware(user_id, callback=callback):
-        await callback.answer()
-        return
+    # Если есть реферал и пользователь новый (впервые запускает бота)
+    if referrer_id and referrer_id != user_id:
+        referrer = get_user(referrer_id)
+        if referrer:
+            # Начисляем голду рефереру
+            settings = get_settings()
+            gold_amount = int(settings.get('gold_per_referral', GOLD_PER_REFERRAL))
+            
+            add_gold(referrer_id, gold_amount, "referral", f"Реферал: {user.username or user_id}")
+            update_referrals_count(referrer_id)
+            
+            # Уведомляем реферера
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_id,
+                    text=f"🎉 Новый реферал!\n"
+                         f"Пользователь @{user.username or user.first_name} присоединился по вашей ссылке.\n"
+                         f"📈 Начислено: +{gold_amount} голды"
+                )
+            except:
+                pass
     
-    user = await get_or_create_user(user_id)
-    referrals = await get_user_referrals(user_id)
-    settings = await get_reward_settings()
+    # Начисляем голду за вступление в канал
+    if has_subscription:
+        db_user = get_user(user_id)
+        if not db_user['joined_channel']:
+            settings = get_settings()
+            join_gold = int(settings.get('gold_per_join', GOLD_PER_JOIN))
+            
+            add_gold(user_id, join_gold, "channel_join", "Вступление в канал")
+            set_joined_channel(user_id)
     
-    text = f"""
-📊 <b>Ваша статистика</b>
-
-👤 <b>Профиль:</b>
-• ID: {user_id}
-• Имя: {user['full_name'] or 'Не указано'}
-• Регистрация: {user['join_date'].strftime('%d.%m.%Y') if user['join_date'] else 'Неизвестно'}
-
-💰 <b>Финансы:</b>
-• Баланс: {user['gold']} голды 🥇
-• Рефералов: {user['referrals']}
-• Заработано на рефералах: {user['referrals'] * settings['referral_reward']} голды
-
-👥 <b>Последние рефералы:</b>
-"""
+    # Отправляем основное сообщение с фотографией
+    caption = f"👋 Привет, {user.first_name}!\n\n"
     
-    if referrals:
-        for i, ref in enumerate(referrals[:5], 1):
-            username = f"@{ref['referred_username']}" if ref['referred_username'] else f"ID:{ref['referred_id']}"
-            date = ref['date'].strftime("%d.%m") if ref['date'] else "??.??"
-            text += f"{i}. {username} - {date} (+{ref['gold_awarded']} 🥇)\n"
-    else:
-        text += "\n<i>Рефералов пока нет</i>\n"
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="💰 Баланс", callback_data="balance"),
-        InlineKeyboardButton(text="👥 Рефералы", callback_data="my_referrals")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")
-    )
-    
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data == "help")
-async def callback_help(callback: types.CallbackQuery):
-    settings = await get_reward_settings()
-    
-    text = f"""
-ℹ️ <b>Помощь по боту</b>
-
-🤖 <b>Как работает бот:</b>
-1. Получите реферальную ссылку
-2. Приглашайте друзей по ссылке
-3. Получайте {settings['referral_reward']} голды за каждого реферала
-4. Ваши друзья получают {settings['join_reward']} голды за регистрацию
-5. Выводите голды
-
-💰 <b>Вывод средств:</b>
-• Минимальная сумма: {settings['min_withdrawal']} голды 🥇
-• Комиссия рынка: {Config.MARKET_COMMISSION}%
-• При выводе укажите скин и ссылку на рынок
-• После одобрения админа ожидайте оплату
-
-👥 <b>Реферальная система:</b>
-• За каждого реферала: {settings['referral_reward']} 🥇
-• За переход по ссылке: {settings['join_reward']} 🥇
-
-⚠️ <b>Важно:</b>
-• Обязательна подписка на канал {Config.REQUIRED_CHANNEL}
-• Для вывода нужен активный баланс
-• Заявки обрабатываются вручную администратором
-
-📞 <b>Поддержка:</b>
-По вопросам обращайтесь к @cosinxx_prime
-    """
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="💰 Баланс", callback_data="balance"),
-        InlineKeyboardButton(text="🎁 Реф. ссылка", callback_data="ref_link")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")
-    )
-    
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data == "my_referrals")
-async def callback_my_referrals(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    
-    if not await check_subscription_middleware(user_id, callback=callback):
-        await callback.answer()
-        return
-    
-    user = await get_or_create_user(user_id)
-    referrals = await get_user_referrals(user_id)
-    settings = await get_reward_settings()
-    
-    text = f"""
-👥 <b>Мои рефералы</b>
-
-📊 <b>Всего приглашено:</b> {user['referrals']}
-💰 <b>Заработано:</b> {user['referrals'] * settings['referral_reward']} голды 🥇
-
-📋 <b>Список рефералов:</b>
-"""
-    
-    if referrals:
-        for i, ref in enumerate(referrals, 1):
-            username = f"@{ref['referred_username']}" if ref['referred_username'] else f"ID: {ref['referred_id']}"
-            date = ref['date'].strftime("%d.%m.%Y") if ref['date'] else "??.??.????"
-            text += f"{i}. {username} - {date}\n"
-    else:
-        text += "\n<i>У вас еще нет рефералов</i>\n"
-    
-    ref_link = f"https://t.me/{Config.BOT_USERNAME}?start={user_id}"
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(
-            text="📢 Поделиться ссылкой",
-            url=f"https://t.me/share/url?url={ref_link}&text=Присоединяйся%20к%20Elon%20Referral%20Bot!%20Зарабатывай%20голду!%20🥇"
-        )
-    )
-    builder.row(
-        InlineKeyboardButton(text="💰 Баланс", callback_data="balance"),
-        InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")
-    )
-    
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data == "ref_link")
-async def callback_ref_link(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    
-    if not await check_subscription_middleware(user_id, callback=callback):
-        await callback.answer()
-        return
-    
-    user = await get_or_create_user(user_id)
-    ref_link = f"https://t.me/{Config.BOT_USERNAME}?start={user_id}"
-    
-    text = f"""
-🎁 <b>Реферальная ссылка</b>
-
-📌 <b>Ваша ссылка:</b>
-<code>{ref_link}</code>
-
-📊 <b>Статистика:</b>
-• Приглашено: {user['referrals']}
-• Баланс: {user['gold']} голды 🥇
-• Заработано на рефералах: {user['referrals'] * 300} голды 🥇
-
-📢 <b>Делитесь ссылкой и зарабатывайте!</b>
-    """
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(
-            text="📱 Поделиться",
-            url=f"https://t.me/share/url?url={ref_link}&text=Присоединяйся%20к%20Elon%20Referral%20Bot!%20Зарабатывай%20голду!%20🥇"
-        )
-    )
-    builder.row(
-        InlineKeyboardButton(text="👥 Мои рефералы", callback_data="my_referrals"),
-        InlineKeyboardButton(text="💰 Баланс", callback_data="balance")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")
-    )
-    
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data == "check_subscription")
-async def callback_check_subscription(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    is_subscribed = await check_subscription(user_id)
-    
-    if is_subscribed:
-        await update_user_subscription(user_id, True)
-        text = "✅ <b>Отлично! Вы подписаны на канал.</b>\n\nТеперь вы можете использовать все функции бота!"
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
-    else:
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(
-                text="📢 Подписаться на канал",
-                url=f"https://t.me/{Config.REQUIRED_CHANNEL.replace('@', '')}"
-            )
-        )
-        keyboard.row(
-            InlineKeyboardButton(text="✅ Проверить снова", callback_data="check_subscription")
-        )
+    if not has_subscription:
+        caption += f"⚠️ Для доступа к боту необходимо подписаться на канал: {CHANNEL_LINK}\n\n"
+        caption += "После подписки нажмите /start"
         
-        text = f"""
-⚠️ <b>Подписка не найдена!</b>
-
-Пожалуйста, подпишитесь на канал:
-{Config.REQUIRED_CHANNEL}
-
-Убедитесь, что вы нажали "JOIN"/"ПОДПИСАТЬСЯ"
-        """
-        
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard.as_markup())
-    
-    await callback.answer()
-
-@dp.callback_query(F.data == "main_menu")
-async def callback_main_menu(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    user = await get_or_create_user(callback.from_user.id)
-    
-    text = f"""
-📱 <b>Главное меню</b>
-
-👋 Привет, {user['full_name'] or 'Друг'}!
-
-💰 Баланс: {user['gold']} голды 🥇
-👥 Рефералов: {user['referrals']}
-
-👇 <b>Выберите раздел:</b>
-    """
-    
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
-    await callback.answer()
-
-# ========== ПРОЦЕСС ВЫВОДА ==========
-
-@dp.callback_query(F.data == "withdraw_start")
-async def callback_withdraw_start(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    
-    if not await check_subscription_middleware(user_id, callback=callback):
-        await callback.answer()
+        keyboard = [[InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_LINK)]]
+        await update.message.reply_photo(
+            photo="https://disk.yandex.ru/i/JT8xfr8dWFmVmw",
+            caption=caption,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
     
-    user = await get_or_create_user(user_id)
-    settings = await get_reward_settings()
+    # Если подписка есть, показываем основной интерфейс
+    db_user = get_user(user_id)
     
-    if user['gold'] < settings['min_withdrawal']:
-        text = f"""
-❌ <b>Недостаточно средств!</b>
+    caption += f"💰 Баланс: {db_user['gold']} голды\n"
+    caption += f"👥 Рефералов: {db_user['referrals_count']}\n"
+    caption += f"🎯 Всего заработано: {db_user['total_earned']} голды\n\n"
+    caption += "Используй кнопки ниже для управления:"
+    
+    await update.message.reply_photo(
+        photo="https://disk.yandex.ru/i/JT8xfr8dWFmVmw",
+        caption=caption,
+        reply_markup=get_main_keyboard()
+    )
 
-Ваш баланс: {user['gold']} голды 🥇
-Минимальный вывод: {settings['min_withdrawal']} голды 🥇
-
-Необходимо еще: {settings['min_withdrawal'] - user['gold']} голды
-        """
-        await callback.message.answer(text, parse_mode="HTML")
-        await callback.answer()
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает баланс пользователя"""
+    user = update.effective_user
+    db_user = get_user(user.id)
+    
+    if not db_user:
+        await update.message.reply_text("Сначала используйте /start")
         return
     
-    await state.set_state(WithdrawalStates.waiting_for_amount)
-    await state.update_data(user_id=user_id, username=callback.from_user.username)
+    text = f"💰 Ваш баланс: {db_user['gold']} голды\n"
+    text += f"👥 Приглашено друзей: {db_user['referrals_count']}\n"
+    text += f"🎯 Всего заработано: {db_user['total_earned']} голды\n\n"
     
-    text = f"""
-💳 <b>Заявка на вывод</b>
-
-💰 Ваш баланс: {user['gold']} голды 🥇
-🎯 Минимальный вывод: {settings['min_withdrawal']} голды 🥇
-💸 Комиссия рынка: {Config.MARKET_COMMISSION}%
-
-📝 <b>Введите сумму вывода (голды):</b>
-Пример: 5000, 10000, 15000
-        """
+    if db_user['gold'] >= MIN_WITHDRAWAL:
+        text += f"✅ Вы можете вывести от {MIN_WITHDRAWAL} голды"
+    else:
+        text += f"❌ Для вывода необходимо минимум {MIN_WITHDRAWAL} голды"
     
-    await callback.message.answer(text, parse_mode="HTML")
-    await callback.answer()
+    await update.message.reply_text(text, reply_markup=get_withdraw_keyboard())
 
-@dp.message(WithdrawalStates.waiting_for_amount)
-async def process_withdrawal_amount(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда помощи"""
+    text = "📚 *Помощь по боту*\n\n"
+    text += "🎯 *Как зарабатывать голду?*\n"
+    text += "1. Приглашайте друзей по реферальной ссылке\n"
+    text += "2. Каждый приглашенный друг принесет вам голду\n"
+    text += "3. Новые пользователи также получают голду за вступление в канал\n\n"
+    text += "💰 *Вывод голды*\n"
+    text += f"- Минимальная сумма вывода: {MIN_WITHDRAWAL} голды\n"
+    text += "- Вывод осуществляется на указанные реквизиты\n\n"
+    text += "⚡ *Быстрые команды:*\n"
+    text += "/start - Запустить бота\n"
+    text += "/balance - Показать баланс\n"
+    text += "/help - Эта справка"
     
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+# ========== ADMIN COMMANDS ==========
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ панель"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("⛔ У вас нет доступа к этой команде")
+        return
+    
+    text = "⚡ *Админ панель*\n\n"
+    text += "Выберите действие:"
+    
+    await update.message.reply_text(
+        text, 
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_admin_keyboard()
+    )
+
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика бота для админа"""
+    if update.effective_user.id != OWNER_ID:
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Общая статистика
+    cur.execute('SELECT COUNT(*) as total_users FROM users')
+    total_users = cur.fetchone()['total_users']
+    
+    cur.execute('SELECT SUM(gold) as total_gold FROM users')
+    total_gold = cur.fetchone()['total_gold'] or 0
+    
+    cur.execute('SELECT SUM(total_earned) as total_earned FROM users')
+    total_earned = cur.fetchone()['total_earned'] or 0
+    
+    # Топ рефералов
+    cur.execute('''
+        SELECT username, referrals_count, total_earned 
+        FROM users 
+        WHERE referrals_count > 0 
+        ORDER BY referrals_count DESC 
+        LIMIT 10
+    ''')
+    top_referrers = cur.fetchall()
+    
+    cur.close()
+    conn.close()
+    
+    # Формируем сообщение
+    text = f"📊 *Статистика бота*\n\n"
+    text += f"👥 Всего пользователей: {total_users}\n"
+    text += f"💰 Всего голды в системе: {total_gold}\n"
+    text += f"🎯 Всего выдано голды: {total_earned}\n\n"
+    
+    if top_referrers:
+        text += "🏆 *Топ 10 рефералов:*\n"
+        for i, user in enumerate(top_referrers, 1):
+            username = user['username'] or f"ID:{user['user_id']}"
+            text += f"{i}. @{username} - {user['referrals_count']} реф. ({user['total_earned']} голды)\n"
+    
+    await update.callback_query.message.edit_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_back")]])
+    )
+
+# ========== CALLBACK HANDLERS ==========
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик inline кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    callback_data = query.data
+    
+    # Проверяем подписку
     try:
-        amount = int(message.text)
-        data = await state.get_data()
-        settings = await get_reward_settings()
-        
-        user = await get_or_create_user(user_id)
-        
-        if amount < settings['min_withdrawal']:
-            await message.answer(f"❌ Минимальная сумма вывода: {settings['min_withdrawal']} голды\n\nВведите сумму еще раз:")
-            return
-        
-        if amount > user['gold']:
-            await message.answer(f"❌ Недостаточно средств! Ваш баланс: {user['gold']} голды\n\nВведите сумму еще раз:")
-            return
-        
-        commission = int(amount * Config.MARKET_COMMISSION / 100)
-        final_amount = amount - commission
-        
-        await state.update_data(
-            amount=amount,
-            commission=commission,
-            final_amount=final_amount
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        has_subscription = member.status in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+    except:
+        has_subscription = False
+    
+    if not has_subscription and not callback_data.startswith("admin"):
+        await query.edit_message_caption(
+            caption=f"⚠️ Для доступа к боту необходимо подписаться на канал: {CHANNEL_LINK}\n\nПосле подписки нажмите /start",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_LINK)]])
         )
-        
-        await state.set_state(WithdrawalStates.waiting_for_skin_photo)
-        
-        text = f"""
-✅ <b>Сумма принята:</b> {amount} голды
-
-📊 <b>Расчет:</b>
-• Сумма: {amount} голды
-• Комиссия ({Config.MARKET_COMMISSION}%): {commission} голды
-• К получению: {final_amount} голды
-
-📸 <b>Теперь отправьте фото скина, который вы выставляете на рынок:</b>
-(Отправьте фото как изображение)
-        """
-        
-        await message.answer(text, parse_mode="HTML")
-        
-    except ValueError:
-        await message.answer("❌ Пожалуйста, введите число!\n\nВведите сумму вывода:")
-
-@dp.message(WithdrawalStates.waiting_for_skin_photo, F.photo)
-async def process_skin_photo(message: types.Message, state: FSMContext):
-    photo = message.photo[-1]
-    file_id = photo.file_id
-    
-    await state.update_data(skin_photo=file_id)
-    await state.set_state(WithdrawalStates.waiting_for_market_link)
-    
-    text = """
-✅ <b>Фото скина принято!</b>
-
-🔗 <b>Теперь отправьте ссылку на скин на рынке:</b>
-Пример: https://steamcommunity.com/market/listings/730/...
-
-⚠️ <b>Важно:</b>
-• Убедитесь, что скин выставлен на рынок
-• Цена должна соответствовать {final_amount} голды
-• После подтверждения ожидайте оплату
-    """
-    
-    await message.answer(text, parse_mode="HTML")
-
-@dp.message(WithdrawalStates.waiting_for_market_link)
-async def process_market_link(message: types.Message, state: FSMContext):
-    market_link = message.text
-    
-    if not market_link.startswith(('http://', 'https://')):
-        await message.answer("❌ Пожалуйста, отправьте корректную ссылку!")
         return
     
-    await state.update_data(market_link=market_link)
-    await state.set_state(WithdrawalStates.confirm_withdrawal)
+    if callback_data == "back":
+        # Возврат в главное меню
+        db_user = get_user(user_id)
+        caption = f"💰 Баланс: {db_user['gold']} голды\n"
+        caption += f"👥 Рефералов: {db_user['referrals_count']}\n"
+        caption += f"🎯 Всего заработано: {db_user['total_earned']} голды\n\n"
+        caption += "Используй кнопки ниже для управления:"
+        
+        await query.edit_message_caption(
+            caption=caption,
+            reply_markup=get_main_keyboard()
+        )
     
-    data = await state.get_data()
-    
-    text = f"""
-📋 <b>Подтверждение заявки на вывод</b>
-
-💰 <b>Детали вывода:</b>
-• Сумма: {data['amount']} голды
-• Комиссия: {data['commission']} голды ({Config.MARKET_COMMISSION}%)
-• К получению: {data['final_amount']} голды
-• Скин: фото прикреплено
-• Ссылка на рынок: {data['market_link']}
-
-⚠️ <b>После подтверждения:</b>
-1. Администратор проверит заявку
-2. Вы получите уведомление
-3. После одобрения ожидайте оплату
-4. Не снимайте скин с рынка до оплаты
-
-✅ <b>Все верно?</b>
-        """
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="✅ Подтвердить вывод", callback_data="confirm_withdrawal"),
-        InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_withdrawal")
-    )
-    
-    if 'skin_photo' in data:
-        await bot.send_photo(
-            chat_id=message.chat.id,
-            photo=data['skin_photo'],
+    elif callback_data == "invite":
+        # Приглашение друзей
+        db_user = get_user(user_id)
+        referral_link = f"https://t.me/{BOT_USERNAME[1:]}?start={user_id}"
+        
+        text = f"👥 *Пригласить друзей*\n\n"
+        text += f"🔗 Ваша реферальная ссылка:\n`{referral_link}`\n\n"
+        text += f"💰 За каждого приглашенного друга вы получите {GOLD_PER_REFERRAL} голды\n"
+        text += f"🎁 Ваш друг получит {GOLD_PER_JOIN} голды за вступление в канал\n\n"
+        text += f"👥 Приглашено: {db_user['referrals_count']} друзей\n"
+        text += f"🎯 Заработано с рефералов: {db_user['total_earned']} голды"
+        
+        await query.edit_message_caption(
             caption=text,
-            parse_mode="HTML",
-            reply_markup=builder.as_markup()
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_invite_keyboard(user_id)
         )
-    else:
-        await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-
-@dp.callback_query(F.data == "confirm_withdrawal")
-async def callback_confirm_withdrawal(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
     
-    conn = await get_db()
-    
-    await conn.execute('''
-        INSERT INTO withdrawals 
-        (user_id, username, amount, commission, final_amount, skin_photo, market_link, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-    ''', 
-    data['user_id'], data.get('username'), data['amount'], 
-    data['commission'], data['final_amount'], data.get('skin_photo'), 
-    data.get('market_link'))
-    
-    withdrawal_id = await conn.fetchval('SELECT lastval()')
-    
-    await conn.close()
-    await state.clear()
-    
-    # Уведомление пользователю
-    text = f"""
-✅ <b>Заявка #{withdrawal_id} создана!</b>
-
-💰 Сумма: {data['amount']} голды
-📊 К получению: {data['final_amount']} голды
-⏳ Статус: <b>ожидает одобрения</b>
-
-📞 Администратор получил уведомление и скоро рассмотрит вашу заявку.
-    """
-    
-    await callback.message.edit_caption(caption=text, parse_mode="HTML")
-    
-    # Уведомление админу
-    admin_text = f"""
-🚨 <b>Новая заявка на вывод #{withdrawal_id}</b>
-
-👤 Пользователь: @{data.get('username', 'Без юзернейма')} (ID: {data['user_id']})
-💰 Сумма: {data['amount']} голды
-💸 Комиссия: {data['commission']} голды
-🎯 К выплате: {data['final_amount']} голды
-🔗 Ссылка на рынок: {data.get('market_link', 'Не указана')}
-
-⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-    """
-    
-    try:
-        if 'skin_photo' in data:
-            await bot.send_photo(
-                chat_id=Config.OWNER_ID,
-                photo=data['skin_photo'],
-                caption=admin_text,
-                parse_mode="HTML",
-                reply_markup=get_admin_withdrawal_keyboard(withdrawal_id)
-            )
+    elif callback_data == "withdraw":
+        # Вывод голды
+        db_user = get_user(user_id)
+        
+        text = f"💰 *Вывод голды*\n\n"
+        text += f"📊 Ваш баланс: {db_user['gold']} голды\n"
+        text += f"💳 Минимальная сумма вывода: {MIN_WITHDRAWAL} голды\n\n"
+        
+        if db_user['gold'] >= MIN_WITHDRAWAL:
+            text += "✅ Вы можете вывести голду!\n"
+            text += "📝 Для вывода напишите @cosinxx_prime"
         else:
-            await bot.send_message(
-                chat_id=Config.OWNER_ID,
-                text=admin_text,
-                parse_mode="HTML",
-                reply_markup=get_admin_withdrawal_keyboard(withdrawal_id)
-            )
-    except Exception as e:
-        logger.error(f"Ошибка отправки админу: {e}")
-    
-    await callback.answer()
-
-@dp.callback_query(F.data == "cancel_withdrawal")
-async def callback_cancel_withdrawal(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_caption(
-        caption="❌ <b>Заявка на вывод отменена</b>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-# ========== АДМИН КОНТРОЛЬ ВЫВОДОВ ==========
-
-@dp.callback_query(F.data.startswith("admin_approve_"))
-async def callback_admin_approve(callback: types.CallbackQuery):
-    if callback.from_user.id != Config.OWNER_ID:
-        await callback.answer("⛔ Нет доступа!")
-        return
-    
-    withdrawal_id = int(callback.data.replace("admin_approve_", ""))
-    
-    await update_withdrawal_status(withdrawal_id, "approved", callback.from_user.id, "Одобрено администратором")
-    
-    # Получаем информацию о выводе
-    conn = await get_db()
-    withdrawal = await conn.fetchrow(
-        'SELECT * FROM withdrawals WHERE id = $1',
-        withdrawal_id
-    )
-    
-    if withdrawal:
-        # Уведомление пользователю
-        user_text = f"""
-✅ <b>Заявка #{withdrawal_id} одобрена!</b>
-
-💰 Сумма: {withdrawal['amount']} голды
-💸 Комиссия: {withdrawal['commission']} голды
-🎯 К получению: {withdrawal['final_amount']} голды
-
-⚠️ <b>Ожидайте оплату!</b>
-Не снимайте скин с рынка до получения оплаты.
-
-⏰ Время обработки: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-        """
+            text += f"❌ Недостаточно голды для вывода\n"
+            text += f"🔢 Необходимо еще {MIN_WITHDRAWAL - db_user['gold']} голды"
         
-        try:
-            await bot.send_message(
-                chat_id=withdrawal['user_id'],
-                text=user_text,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка отправки пользователю: {e}")
-    
-    await conn.close()
-    
-    await callback.message.edit_caption(
-        caption=f"✅ <b>Заявка #{withdrawal_id} одобрена!</b>\n\nПользователь уведомлен.",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("admin_reject_"))
-async def callback_admin_reject(callback: types.CallbackQuery):
-    if callback.from_user.id != Config.OWNER_ID:
-        await callback.answer("⛔ Нет доступа!")
-        return
-    
-    withdrawal_id = int(callback.data.replace("admin_reject_", ""))
-    
-    # Здесь можно добавить запрос причины отклонения
-    # Для простоты просто отклоняем
-    await update_withdrawal_status(withdrawal_id, "rejected", callback.from_user.id, "Отклонено администратором")
-    
-    # Получаем информацию о выводе
-    conn = await get_db()
-    withdrawal = await conn.fetchrow(
-        'SELECT * FROM withdrawals WHERE id = $1',
-        withdrawal_id
-    )
-    
-    if withdrawal:
-        # Уведомление пользователю
-        user_text = f"""
-❌ <b>Заявка #{withdrawal_id} отклонена!</b>
-
-💰 Сумма: {withdrawal['amount']} голды
-
-📞 <b>Причина:</b> отклонено администратором
-🔄 Вы можете создать новую заявку
-
-⏰ Время обработки: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-        """
-        
-        try:
-            await bot.send_message(
-                chat_id=withdrawal['user_id'],
-                text=user_text,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка отправки пользователю: {e}")
-    
-    await conn.close()
-    
-    await callback.message.edit_caption(
-        caption=f"❌ <b>Заявка #{withdrawal_id} отклонена!</b>\n\nПользователь уведомлен.",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(Command("admin"))
-async def cmd_admin(message: types.Message):
-    user_id = message.from_user.id
-    
-    if user_id != Config.OWNER_ID:
-        await message.answer("⛔ Нет доступа!")
-        return
-    
-    conn = await get_db()
-    
-    total_users = await conn.fetchval('SELECT COUNT(*) FROM users')
-    total_referrals = await conn.fetchval('SELECT SUM(referrals) FROM users')
-    total_gold = await conn.fetchval('SELECT SUM(gold) FROM users')
-    
-    pending_withdrawals = await get_pending_withdrawals()
-    
-    settings = await get_reward_settings()
-    
-    text = f"""
-🛠️ <b>Админ панель</b>
-
-📊 <b>Статистика:</b>
-• Пользователей: {total_users}
-• Рефералов: {total_referrals}
-• Всего голды: {total_gold} 🥇
-
-⏳ <b>Ожидают вывода:</b> {len(pending_withdrawals)} заявок
-
-⚙️ <b>Текущие настройки:</b>
-• За реферала: {settings['referral_reward']} голды
-• За переход: {settings['join_reward']} голды
-• Мин. вывод: {settings['min_withdrawal']} голды
-    """
-    
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="📋 Управление выводами", callback_data="admin_withdrawals"),
-        InlineKeyboardButton(text="⚙️ Настройки наград", callback_data="admin_settings")
-    )
-    builder.row(
-        InlineKeyboardButton(text="📊 Полная статистика", callback_data="admin_full_stats"),
-        InlineKeyboardButton(text="📣 Рассылка", callback_data="admin_broadcast")
-    )
-    
-    await conn.close()
-    await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-
-@dp.callback_query(F.data == "admin_withdrawals")
-async def callback_admin_withdrawals(callback: types.CallbackQuery):
-    if callback.from_user.id != Config.OWNER_ID:
-        await callback.answer("⛔ Нет доступа!")
-        return
-    
-    pending_withdrawals = await get_pending_withdrawals()
-    
-    if not pending_withdrawals:
-        text = "✅ <b>Нет ожидающих заявок на вывод</b>"
-        await callback.message.answer(text, parse_mode="HTML")
-        await callback.answer()
-        return
-    
-    text = f"""
-📋 <b>Ожидающие заявки на вывод:</b>
-Всего: {len(pending_withdrawals)} заявок
-    """
-    
-    for wd in pending_withdrawals[:5]:  # Показываем первые 5
-        text += f"\n──────────────\n"
-        text += f"🆔 <b>Заявка #{wd['id']}</b>\n"
-        text += f"👤 Пользователь: @{wd['username'] or 'Без юзернейма'}\n"
-        text += f"💰 Сумма: {wd['amount']} голды\n"
-        text += f"💸 Комиссия: {wd['commission']} голды\n"
-        text += f"🎯 К выплате: {wd['final_amount']} голды\n"
-        text += f"⏰ Дата: {wd['request_date'].strftime('%d.%m %H:%M')}\n"
-        
-        builder = InlineKeyboardBuilder()
-        builder.row(
-            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"admin_approve_{wd['id']}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin_reject_{wd['id']}")
+        await query.edit_message_caption(
+            caption=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_withdraw_keyboard()
         )
-        
-        if wd['skin_photo']:
-            await bot.send_photo(
-                chat_id=callback.message.chat.id,
-                photo=wd['skin_photo'],
-                caption=text,
-                parse_mode="HTML",
-                reply_markup=builder.as_markup()
-            )
-        else:
-            await callback.message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
-        text = ""  # Сбрасываем текст для следующего сообщения
     
-    await callback.answer()
+    elif callback_data.startswith("withdraw_"):
+        # Обработка вывода
+        amount = int(callback_data.split("_")[1])
+        db_user = get_user(user_id)
+        
+        if db_user['gold'] >= amount:
+            # Создаем заявку на вывод
+            create_withdrawal(user_id, amount)
+            
+            # Списание голды
+            add_gold(user_id, -amount, "withdrawal", "Вывод голды")
+            
+            text = f"✅ Заявка на вывод {amount} голды создана!\n\n"
+            text += "📞 Свяжитесь с @cosinxx_prime для получения средств"
+            
+            # Уведомляем админа
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=f"📤 Новая заявка на вывод!\n\n"
+                         f"👤 Пользователь: @{query.from_user.username or query.from_user.id}\n"
+                         f"💰 Сумма: {amount} голды\n"
+                         f"📊 Баланс после: {db_user['gold'] - amount} голды"
+                )
+            except:
+                pass
+        else:
+            text = f"❌ Недостаточно голды!\n"
+            text += f"💰 Ваш баланс: {db_user['gold']} голды\n"
+            text += f"🔢 Требуется: {amount} голды"
+        
+        await query.edit_message_caption(
+            caption=text,
+            reply_markup=get_withdraw_keyboard()
+        )
+    
+    elif callback_data == "top":
+        # Топ рефералов
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cur.execute('''
+            SELECT username, referrals_count, total_earned 
+            FROM users 
+            WHERE referrals_count > 0 
+            ORDER BY referrals_count DESC 
+            LIMIT 10
+        ''')
+        top_users = cur.fetchall()
+        
+        cur.close()
+        conn.close()
+        
+        text = "🏆 *Топ рефералов*\n\n"
+        
+        if top_users:
+            for i, user in enumerate(top_users, 1):
+                username = user['username'] or "Аноним"
+                text += f"{i}. @{username}\n"
+                text += f"   👥 {user['referrals_count']} реф. | 💰 {user['total_earned']} голды\n\n"
+        else:
+            text += "Пока нет активных рефералов\n"
+            text += "Станьте первым!\n\n"
+        
+        text += "💡 *Как попасть в топ?*\n"
+        text += "Приглашайте друзей и зарабатывайте голду!"
+        
+        await query.edit_message_caption(
+            caption=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back")]])
+        )
+    
+    elif callback_data == "help":
+        # Помощь
+        text = "📚 *Помощь по боту*\n\n"
+        text += "🎯 *Как зарабатывать голду?*\n"
+        text += "1. Приглашайте друзей по реферальной ссылке\n"
+        text += "2. Каждый приглашенный друг принесет вам голду\n"
+        text += "3. Новые пользователи также получают голду за вступление в канал\n\n"
+        text += "💰 *Вывод голды*\n"
+        text += f"- Минимальная сумма вывода: {MIN_WITHDRAWAL} голды\n"
+        text += "- Вывод осуществляется на указанные реквизиты\n\n"
+        text += "⚡ *Быстрые команды:*\n"
+        text += "/start - Запустить бота\n"
+        text += "/balance - Показать баланс\n"
+        text += "/help - Эта справка"
+        
+        await query.edit_message_caption(
+            caption=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back")]])
+        )
+    
+    elif callback_data == "admin_settings":
+        # Настройки админа
+        if user_id != OWNER_ID:
+            return
+        
+        settings = get_settings()
+        
+        text = "⚙️ *Настройки бота*\n\n"
+        text += f"💰 Голда за реферала: {settings.get('gold_per_referral', GOLD_PER_REFERRAL)}\n"
+        text += f"🎁 Голда за вступление: {settings.get('gold_per_join', GOLD_PER_JOIN)}\n"
+        text += f"💳 Мин. вывод: {MIN_WITHDRAWAL}\n\n"
+        text += "Выберите параметр для изменения:"
+        
+        await query.edit_message_caption(
+            caption=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_settings_keyboard()
+        )
+    
+    elif callback_data == "set_referral":
+        # Изменение голды за реферала
+        if user_id != OWNER_ID:
+            return
+        
+        text = "✏️ *Изменение голды за реферала*\n\n"
+        text += "Введите новое количество голды (только число):"
+        
+        await query.edit_message_caption(
+            caption=text,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['awaiting_setting'] = 'gold_per_referral'
+    
+    elif callback_data == "set_join":
+        # Изменение голды за вступление
+        if user_id != OWNER_ID:
+            return
+        
+        text = "✏️ *Изменение голды за вступление*\n\n"
+        text += "Введите новое количество голды (только число):"
+        
+        await query.edit_message_caption(
+            caption=text,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['awaiting_setting'] = 'gold_per_join'
+    
+    elif callback_data == "admin_back":
+        # Назад в админ панель
+        if user_id != OWNER_ID:
+            return
+        
+        text = "⚡ *Админ панель*\n\n"
+        text += "Выберите действие:"
+        
+        await query.edit_message_caption(
+            caption=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_admin_keyboard()
+        )
+    
+    elif callback_data == "admin_stats":
+        # Статистика админа
+        await admin_stats_command(update, context)
 
-# ========== ЗАПУСК БОТА ==========
+# ========== ОБРАБОТЧИК СООБЩЕНИЙ ==========
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений"""
+    user_id = update.effective_user.id
+    message_text = update.message.text
+    
+    # Проверяем, ожидаем ли мы настройку от админа
+    if user_id == OWNER_ID and 'awaiting_setting' in context.user_data:
+        setting_key = context.user_data.pop('awaiting_setting', None)
+        
+        if setting_key and message_text.isdigit():
+            new_value = int(message_text)
+            update_setting(setting_key, str(new_value))
+            
+            text = f"✅ Настройка обновлена!\n"
+            
+            if setting_key == 'gold_per_referral':
+                text += f"Голда за реферала изменена на: {new_value}"
+            elif setting_key == 'gold_per_join':
+                text += f"Голда за вступление изменена на: {new_value}"
+            
+            await update.message.reply_text(
+                text,
+                reply_markup=get_settings_keyboard()
+            )
+            return
+    
+    # Обычное сообщение - перенаправляем в главное меню
+    await start_command(update, context)
 
-async def main():
-    await init_db()
-    logger.info(f"Бот запущен! @{Config.BOT_USERNAME}")
-    await dp.start_polling(bot)
+# ========== ОШИБКИ ==========
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка: {context.error}")
+    
+    if update and update.effective_user:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="⚠️ Произошла ошибка. Пожалуйста, попробуйте еще раз."
+            )
+        except:
+            pass
+
+# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
+def main():
+    """Запуск бота"""
+    # Инициализация базы данных
+    init_database()
+    
+    # Создание приложения
+    app = Application.builder().token(TOKEN).build()
+    
+    # Регистрация обработчиков команд
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("balance", balance_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    
+    # Регистрация обработчиков кнопок
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Регистрация обработчика сообщений
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Регистрация обработчика ошибок
+    app.add_error_handler(error_handler)
+    
+    # Запуск бота
+    print(f"🤖 Бот запущен: @{BOT_USERNAME[1:]}")
+    print(f"👑 Владелец: {OWNER_ID}")
+    print(f"📢 Канал: {CHANNEL_USERNAME}")
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
