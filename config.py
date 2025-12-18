@@ -14,6 +14,6 @@ class Config:
     REFERRAL_REWARD = 300
     JOIN_REWARD = 200
     MIN_WITHDRAWAL = 5000
-    MARKET_COMMISSION = 0  # 15% комиссия рынка
+    MARKET_COMMISSION = 20  # 20% комиссия рынка
     
     BALANCE_IMAGE = "https://disk.yandex.ru/i/JT8xfr8dWFmVmw"
